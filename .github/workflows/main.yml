@@ -24,43 +24,47 @@ jobs:
           # Qwen2.5:0.5b defaults to a highly optimized 4-bit quantization layout
           ollama pull qwen2.5:0.5b
 
-      - name: Start Cloudflare Quick Tunnel (No Token Required)
+      - name: Check Model
+        run: |
+          ollama show qwen2.5:0.5b --modelfile
+
+      - name: Start Cloudflare Quick Tunnel
         run: |
           echo "=== Downloading Cloudflare Standalone Binary ==="
-          # Create local bin directory if it doesn't exist
           mkdir -p ~/.local/bin
-          
-          # FIXED: Download the actual direct standalone binary, NOT the .deb package
-          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o ~/.local/bin/cloudflared
+      
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o ~/.local/bin/cloudflared
+      
           chmod +x ~/.local/bin/cloudflared
-          
-          # Append to PATH for the duration of this step
           export PATH="$HOME/.local/bin:$PATH"
-
-          echo "=== Starting Anonymous Quick Tunnel ==="
-          # Running 'tunnel' without tokens creates a free quick tunnel
-          # Routes external traffic to Ollama's default local port (11434)
-          cloudflared tunnel --url http://localhost:11434 > cloudflared.log 2>&1 &
-          
-          echo "=== Waiting for Public URL Generation ==="
+      
+          echo "=== Starting Cloudflare Quick Tunnel ==="
+      
+          cloudflared tunnel \
+            --url http://localhost:11434 \
+            --http-host-header="localhost:11434" \
+            > cloudflared.log 2>&1 &
+      
+          echo "=== Waiting for Public URL ==="
           sleep 8
-          
-          # Extract and print the randomly generated .trycloudflare.com URL from logs
+      
+          cat cloudflared.log
+      
           TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' cloudflared.log | head -n 1)
-          
+      
           if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ ERROR: Failed to generate Cloudflare Tunnel URL. Check cloudflared.log below:"
+            echo "❌ Failed to generate Cloudflare Tunnel URL"
             cat cloudflared.log
             exit 1
           fi
-          
+      
           echo "------------------------------------------------"
           echo "YOUR FREE ANONYMOUS URL IS:"
           echo "$TUNNEL_URL"
           echo "------------------------------------------------"
-          
-          # Save the URL to the global environment so subsequent steps can use it
-          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+      
+          echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
 
 
       - name: Run Benchmark Test (Token Throughput Evaluation)
