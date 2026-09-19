@@ -1,100 +1,422 @@
-name: LLM Benchmark & Cloudflare Tunnel
+name: LLM Benchmark - llama.cpp 3B Q4_K_M
 
 on:
-  workflow_dispatch: # Allows manual trigger from the GitHub Actions tab
+  workflow_dispatch:
 
 jobs:
-  run-llm:
+  run-llama:
     runs-on: ubuntu-latest
+
     steps:
+
+      # ------------------------------------------------------------
+      # 1. Checkout
+      # ------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Ollama
-        run: |
-          curl -fsSL https://ollama.com/install.sh | sh
 
-      - name: Start Ollama Service
+      # ------------------------------------------------------------
+      # 2. Show Runner Hardware
+      # ------------------------------------------------------------
+      - name: Check Runner Hardware
         run: |
-          ollama serve > ollama.log 2>&1 &
-          sleep 5 # Give it a few seconds to initialize
+          echo "=========================================="
+          echo "RUNNER HARDWARE"
+          echo "=========================================="
 
-      - name: Pull and Run 0.5B Model (4-bit quantized)
-        run: |
-          # Qwen2.5:0.5b defaults to a highly optimized 4-bit quantization layout
-          ollama pull qwen2.5:0.5b
+          echo ""
+          echo "CPU:"
+          lscpu | grep -E 'Model name|CPU\(s\)|Thread|Core|MHz'
 
-      - name: Check Model
-        run: |
-          ollama show qwen2.5:0.5b --modelfile
+          echo ""
+          echo "RAM:"
+          free -h
 
-      - name: Start Cloudflare Quick Tunnel
+          echo ""
+          echo "Disk:"
+          df -h /
+
+          echo ""
+          echo "GPU:"
+          lspci | grep -Ei 'vga|3d|nvidia|amd' || true
+
+          echo ""
+          echo "=========================================="
+
+
+      # ------------------------------------------------------------
+      # 3. Install llama.cpp
+      #
+      # Ubuntu runner:
+      # Download official prebuilt Linux release.
+      # ------------------------------------------------------------
+      - name: Install llama.cpp
         run: |
-          echo "=== Downloading Cloudflare Standalone Binary ==="
-          mkdir -p ~/.local/bin
-      
-          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o ~/.local/bin/cloudflared
-      
-          chmod +x ~/.local/bin/cloudflared
-          export PATH="$HOME/.local/bin:$PATH"
-      
-          echo "=== Starting Cloudflare Quick Tunnel ==="
-      
-          cloudflared tunnel \
-            --url http://localhost:11434 \
-            --http-host-header="localhost:11434" \
-            > cloudflared.log 2>&1 &
-      
-          echo "=== Waiting for Public URL ==="
-          sleep 8
-      
-          cat cloudflared.log
-      
-          TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' cloudflared.log | head -n 1)
-      
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Failed to generate Cloudflare Tunnel URL"
-            cat cloudflared.log
+          set -e
+
+          echo "Downloading llama.cpp..."
+
+          mkdir -p "$HOME/llama"
+
+          # Get latest release information
+          RELEASE_URL=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
+            | jq -r '.assets[] | select(.name | test("ubuntu.*x64.*\\.tar\\.gz$")) | .browser_download_url' \
+            | head -n 1)
+
+          if [ -z "$RELEASE_URL" ]; then
+            echo "Could not find llama.cpp Linux x64 release."
+            echo "Falling back to source build."
+
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+
+            cmake -S llama.cpp -B llama.cpp/build \
+              -DGGML_NATIVE=ON
+
+            cmake --build llama.cpp/build \
+              --config Release \
+              -j2
+
+            LLAMA_SERVER="$GITHUB_WORKSPACE/llama.cpp/build/bin/llama-server"
+
+          else
+            echo "Release:"
+            echo "$RELEASE_URL"
+
+            curl -L "$RELEASE_URL" \
+              -o /tmp/llama.tar.gz
+
+            tar -xzf /tmp/llama.tar.gz \
+              -C "$HOME/llama" \
+              --strip-components=1
+
+            LLAMA_SERVER=$(find "$HOME/llama" \
+              -type f \
+              -name "llama-server" \
+              | head -n 1)
+          fi
+
+          if [ ! -x "$LLAMA_SERVER" ]; then
+            echo "llama-server not found!"
             exit 1
           fi
-      
-          echo "------------------------------------------------"
-          echo "YOUR FREE ANONYMOUS URL IS:"
+
+          echo "llama-server:"
+          "$LLAMA_SERVER" --version
+
+          echo "LLAMA_SERVER=$LLAMA_SERVER" >> "$GITHUB_ENV"
+
+
+      # ------------------------------------------------------------
+      # 4. Download Qwen2.5 3B Q4_K_M
+      #
+      # llama.cpp can download directly from Hugging Face.
+      # ------------------------------------------------------------
+      - name: Download Qwen2.5 3B Q4_K_M
+        run: |
+          echo "=========================================="
+          echo "MODEL"
+          echo "=========================================="
+          echo "Qwen2.5-3B-Instruct"
+          echo "Quantization: Q4_K_M"
+          echo "=========================================="
+
+          mkdir -p "$HOME/models"
+
+          huggingface-cli download \
+            Qwen/Qwen2.5-3B-Instruct-GGUF \
+            qwen2.5-3b-instruct-q4_k_m.gguf \
+            --local-dir "$HOME/models"
+
+          echo ""
+          echo "Downloaded model:"
+          ls -lh "$HOME/models"
+
+
+      # ------------------------------------------------------------
+      # 5. Start llama.cpp server
+      #
+      # OpenAI-compatible API:
+      #
+      # http://localhost:8080/v1/chat/completions
+      # ------------------------------------------------------------
+      - name: Start llama.cpp Server
+        run: |
+          set -e
+
+          MODEL="$HOME/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+
+          echo "Starting llama.cpp..."
+
+          "$LLAMA_SERVER" \
+            -m "$MODEL" \
+            --host 0.0.0.0 \
+            --port 8080 \
+            -c 4096 \
+            -t 4 \
+            > llama-server.log 2>&1 &
+
+          echo $! > llama-server.pid
+
+          echo "Waiting for llama.cpp..."
+
+          for i in {1..60}; do
+
+            if curl -sf http://localhost:8080/health > /dev/null; then
+              echo "llama.cpp is ready!"
+              break
+            fi
+
+            sleep 2
+
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "SERVER LOG"
+          echo "=========================================="
+
+          tail -n 100 llama-server.log
+
+
+      # ------------------------------------------------------------
+      # 6. Inspect server/model
+      # ------------------------------------------------------------
+      - name: Check llama.cpp Server
+        run: |
+          echo "=========================================="
+          echo "SERVER PROPERTIES"
+          echo "=========================================="
+
+          curl -s http://localhost:8080/props | jq .
+
+          echo ""
+          echo "=========================================="
+          echo "HEALTH"
+          echo "=========================================="
+
+          curl -s http://localhost:8080/health
+
+          echo ""
+
+          echo "=========================================="
+          echo "MEMORY"
+          echo "=========================================="
+
+          free -h
+
+
+      # ------------------------------------------------------------
+      # 7. Local benchmark
+      #
+      # IMPORTANT:
+      # We use max_tokens=400 so every model is tested
+      # under approximately the same generation workload.
+      # ------------------------------------------------------------
+      - name: Run 3B Benchmark
+        run: |
+          set -e
+
+          echo ""
+          echo "============================================================"
+          echo "       QWEN 2.5 3B Q4_K_M LLAMA.CPP BENCHMARK"
+          echo "============================================================"
+
+          TOTAL_TOKENS=0
+          TOTAL_GENERATION_TIME=0
+          SUCCESS=0
+
+          for i in {1..10}; do
+
+            echo ""
+            echo "------------------------------------------------------------"
+            echo "TEST $i"
+            echo "------------------------------------------------------------"
+
+            START=$(date +%s.%N)
+
+            RESPONSE=$(curl -s \
+              --max-time 120 \
+              -X POST \
+              http://localhost:8080/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -d '{
+                "model": "qwen2.5-3b-instruct-q4_k_m.gguf",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Explain in detail how photosynthesis works, including the light-dependent reactions, photosystems, ATP, NADPH, Calvin cycle, and carbon fixation. Give a clear technical explanation."
+                  }
+                ],
+                "temperature": 0.2,
+                "max_tokens": 400,
+                "stream": false
+              }')
+
+            END=$(date +%s.%N)
+
+            TOTAL_TIME=$(awk "BEGIN {print $END - $START}")
+
+            if echo "$RESPONSE" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
+
+              TOKENS=$(echo "$RESPONSE" \
+                | jq -r '.usage.completion_tokens // 0')
+
+              if [ "$TOKENS" -gt 0 ]; then
+
+                TPS=$(awk \
+                  "BEGIN {printf \"%.2f\", $TOKENS / $TOTAL_TIME}")
+
+                echo "Output tokens : $TOKENS"
+                echo "Total time    : ${TOTAL_TIME}s"
+                echo "Approx TPS    : $TPS"
+
+                TOTAL_TOKENS=$((TOTAL_TOKENS + TOKENS))
+                TOTAL_GENERATION_TIME=$(awk \
+                  "BEGIN {print $TOTAL_GENERATION_TIME + $TOTAL_TIME}")
+
+                SUCCESS=$((SUCCESS + 1))
+
+              else
+
+                echo "WARNING: No token count returned."
+
+              fi
+
+            else
+
+              echo "ERROR:"
+              echo "$RESPONSE" | jq . || echo "$RESPONSE"
+
+            fi
+
+          done
+
+
+          echo ""
+          echo "============================================================"
+          echo "FINAL RESULTS"
+          echo "============================================================"
+
+          echo "Successful requests : $SUCCESS / 10"
+          echo "Total tokens        : $TOTAL_TOKENS"
+          echo "Total time          : ${TOTAL_GENERATION_TIME}s"
+
+          if [ "$TOTAL_TOKENS" -gt 0 ]; then
+
+            AVG_TPS=$(awk \
+              "BEGIN {printf \"%.2f\", $TOTAL_TOKENS / $TOTAL_GENERATION_TIME}")
+
+            echo ""
+            echo "=========================================="
+            echo "AVERAGE THROUGHPUT: $AVG_TPS tokens/sec"
+            echo "=========================================="
+
+          fi
+
+
+      # ------------------------------------------------------------
+      # 8. Start Cloudflare Quick Tunnel
+      # ------------------------------------------------------------
+      - name: Start Cloudflare Quick Tunnel
+        run: |
+          set -e
+
+          echo "Installing cloudflared..."
+
+          mkdir -p "$HOME/.local/bin"
+
+          curl -L \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o "$HOME/.local/bin/cloudflared"
+
+          chmod +x "$HOME/.local/bin/cloudflared"
+
+          export PATH="$HOME/.local/bin:$PATH"
+
+          echo "Starting Cloudflare tunnel..."
+
+          cloudflared tunnel \
+            --url http://localhost:8080 \
+            --http-host-header="localhost:8080" \
+            > cloudflared.log 2>&1 &
+
+          echo $! > cloudflared.pid
+
+          echo "Waiting for tunnel..."
+
+          sleep 8
+
+          cat cloudflared.log
+
+          TUNNEL_URL=$(grep \
+            -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' \
+            cloudflared.log \
+            | head -n 1)
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Tunnel failed!"
+            exit 1
+          fi
+
+          echo ""
+          echo "============================================================"
+          echo "PUBLIC OPENAI-COMPATIBLE ENDPOINT"
+          echo "============================================================"
           echo "$TUNNEL_URL"
-          echo "------------------------------------------------"
-      
+          echo ""
+          echo "API:"
+          echo "$TUNNEL_URL/v1/chat/completions"
+          echo "============================================================"
+
           echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
 
 
-      - name: Run Benchmark Test (Token Throughput Evaluation)
+      # ------------------------------------------------------------
+      # 9. Test the public OpenAI-compatible endpoint
+      # ------------------------------------------------------------
+      - name: Test Public API
         run: |
-          echo "=== Testing Local Inference Speed ==="
-          
-          # Send a heavy prompt forcing a long generation sequence to calculate accurate tokens/sec
-          RESPONSE=$(curl -s -X POST http://localhost:11434/api/generate -d '{
-            "model": "qwen2.5:0.5b",
-            "prompt": "Write a 300-word essay detailing the cycle of water in nature.",
-            "stream": false
-          }')
-          
-          # Parse the evaluation metrics returned out-of-the-box by Ollama's API
-          TOTAL_DURATION=$(echo "$RESPONSE" | jq '.total_duration')
-          EVAL_COUNT=$(echo "$RESPONSE" | jq '.eval_count')
-          EVAL_DURATION=$(echo "$RESPONSE" | jq '.eval_duration')
-          
-          # Convert nanoseconds to seconds for clear throughput calculation
-          DURATION_SECS=$(echo "scale=2; $EVAL_DURATION / 1000000000" | bc)
-          TOKENS_PER_SEC=$(echo "scale=2; $EVAL_COUNT / $DURATION_SECS" | bc)
-          
-          echo "Total Output Tokens Generated: $EVAL_COUNT"
-          echo "Generation Time: $DURATION_SECS seconds"
-          echo "----------------------------------------"
-          echo "ACTUAL THROUGHPUT: $TOKENS_PER_SEC tokens/second"
-          echo "----------------------------------------"
+          echo ""
+          echo "Testing Cloudflare -> llama.cpp..."
 
-      - name: Keep Workflow Alive for External Prompts
+          RESPONSE=$(curl -s \
+            --max-time 60 \
+            -X POST \
+            "$TUNNEL_URL/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "qwen2.5-3b-instruct-q4_k_m.gguf",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "What is the difference between a CPU and a GPU?"
+                }
+              ],
+              "max_tokens": 200,
+              "stream": false
+            }')
+
+          echo "$RESPONSE" | jq .
+
+
+      # ------------------------------------------------------------
+      # 10. Keep alive for external testing
+      # ------------------------------------------------------------
+      - name: Keep Workflow Alive
         run: |
-          echo "Tunnel is active. You can now prompt the endpoint externally via your Cloudflare URL."
-          echo "This action will remain open for 15 minutes for live manual testing..."
-          sleep 900 # Keeps the runner open for 15 minutes before terminating automatically
+          echo ""
+          echo "============================================================"
+          echo "LLAMA.CPP SERVER IS LIVE"
+          echo "============================================================"
+          echo ""
+          echo "Public endpoint:"
+          echo "$TUNNEL_URL/v1/chat/completions"
+          echo ""
+          echo "Model:"
+          echo "Qwen2.5-3B-Instruct Q4_K_M"
+          echo ""
+          echo "The runner will remain alive for 15 minutes."
+          echo "============================================================"
+
+          sleep 900
