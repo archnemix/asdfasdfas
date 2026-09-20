@@ -1,4 +1,4 @@
-name: LLM Benchmark - llama.cpp 3B Q4_K_M
+name: LLM Benchmark - OLMoE 1B-7B Q4_K_M 16K
 
 on:
   workflow_dispatch:
@@ -47,9 +47,6 @@ jobs:
 
       # ------------------------------------------------------------
       # 3. Install llama.cpp
-      #
-      # Ubuntu runner:
-      # Download official prebuilt Linux release.
       # ------------------------------------------------------------
       - name: Install llama.cpp
         run: |
@@ -59,12 +56,12 @@ jobs:
 
           mkdir -p "$HOME/llama"
 
-          # Get latest release information
           RELEASE_URL=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
             | jq -r '.assets[] | select(.name | test("ubuntu.*x64.*\\.tar\\.gz$")) | .browser_download_url' \
             | head -n 1)
 
           if [ -z "$RELEASE_URL" ]; then
+
             echo "Could not find llama.cpp Linux x64 release."
             echo "Falling back to source build."
 
@@ -80,6 +77,7 @@ jobs:
             LLAMA_SERVER="$GITHUB_WORKSPACE/llama.cpp/build/bin/llama-server"
 
           else
+
             echo "Release:"
             echo "$RELEASE_URL"
 
@@ -94,6 +92,7 @@ jobs:
               -type f \
               -name "llama-server" \
               | head -n 1)
+
           fi
 
           if [ ! -x "$LLAMA_SERVER" ]; then
@@ -101,6 +100,7 @@ jobs:
             exit 1
           fi
 
+          echo ""
           echo "llama-server:"
           "$LLAMA_SERVER" --version
 
@@ -108,25 +108,40 @@ jobs:
 
 
       # ------------------------------------------------------------
-      # 4. Download Qwen2.5 3B Q4_K_M
+      # 4. Download OLMoE
       #
-      # llama.cpp can download directly from Hugging Face.
+      # Model:
+      # OLMoE-1B-7B-0924-Instruct
+      #
+      # Total parameters: ~7B
+      # Active parameters: ~1B
+      # Quantization: Q4_K_M
+      #
+      # Official GGUF:
+      # allenai/OLMoE-1B-7B-0924-Instruct-GGUF
       # ------------------------------------------------------------
-      - name: Download Qwen2.5 3B Q4_K_M
+      - name: Download OLMoE 1B-7B Q4_K_M
         run: |
           set -e
 
           echo "=========================================="
           echo "MODEL"
           echo "=========================================="
-          echo "Qwen2.5-3B-Instruct"
+          echo "OLMoE-1B-7B-0924-Instruct"
+          echo "Architecture: Mixture of Experts"
+          echo "Total parameters: ~7B"
+          echo "Active parameters: ~1B"
           echo "Quantization: Q4_K_M"
+          echo "Context target: 16K"
           echo "=========================================="
 
           mkdir -p "$HOME/models"
 
-          MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf"
+          MODEL_URL="https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf"
 
+          MODEL_PATH="$HOME/models/olmoe-1b-7b-0924-instruct-q4_k_m.gguf"
+
+          echo ""
           echo "Downloading:"
           echo "$MODEL_URL"
           echo ""
@@ -135,54 +150,68 @@ jobs:
             --fail \
             --progress-bar \
             "$MODEL_URL" \
-            -o "$HOME/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+            -o "$MODEL_PATH"
 
           echo ""
           echo "Downloaded model:"
           ls -lh "$HOME/models"
 
-          echo ""
-          echo "Checking model file..."
-
-          if [ ! -f "$HOME/models/qwen2.5-3b-instruct-q4_k_m.gguf" ]; then
+          if [ ! -f "$MODEL_PATH" ]; then
             echo "ERROR: Model download failed."
             exit 1
           fi
 
+          echo ""
           echo "Model successfully downloaded."
 
+          echo ""
+          echo "Model size:"
+          du -h "$MODEL_PATH"
+
+          echo ""
+          echo "RAM before loading:"
+          free -h
+
 
       # ------------------------------------------------------------
-      # 5. Start llama.cpp server
+      # 5. Start llama.cpp
       #
-      # OpenAI-compatible API:
-      #
-      # http://localhost:8080/v1/chat/completions
+      # IMPORTANT:
+      # 16384 context
       # ------------------------------------------------------------
-      - name: Start llama.cpp Server
+      - name: Start OLMoE Server
         run: |
           set -e
 
-          MODEL="$HOME/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+          MODEL="$HOME/models/olmoe-1b-7b-0924-instruct-q4_k_m.gguf"
 
-          echo "Starting llama.cpp..."
+          echo "=========================================="
+          echo "STARTING OLMoE"
+          echo "=========================================="
 
           "$LLAMA_SERVER" \
             -m "$MODEL" \
             --host 0.0.0.0 \
             --port 8080 \
-            -c 4096 \
+            -c 16384 \
             -t 4 \
             > llama-server.log 2>&1 &
 
           echo $! > llama-server.pid
 
+          echo "Server PID:"
+          cat llama-server.pid
+
+          echo ""
           echo "Waiting for llama.cpp..."
 
-          for i in {1..60}; do
+          READY=0
+
+          for i in {1..120}; do
 
             if curl -sf http://localhost:8080/health > /dev/null; then
               echo "llama.cpp is ready!"
+              READY=1
               break
             fi
 
@@ -190,19 +219,29 @@ jobs:
 
           done
 
+          if [ "$READY" -ne 1 ]; then
+            echo ""
+            echo "ERROR: llama.cpp did not become ready."
+            echo ""
+            echo "SERVER LOG:"
+            tail -n 200 llama-server.log
+            exit 1
+          fi
+
           echo ""
           echo "=========================================="
           echo "SERVER LOG"
           echo "=========================================="
 
-          tail -n 100 llama-server.log
+          tail -n 150 llama-server.log
 
 
       # ------------------------------------------------------------
-      # 6. Inspect server/model
+      # 6. Inspect model + RAM
       # ------------------------------------------------------------
-      - name: Check llama.cpp Server
+      - name: Check OLMoE Server
         run: |
+
           echo "=========================================="
           echo "SERVER PROPERTIES"
           echo "=========================================="
@@ -218,28 +257,54 @@ jobs:
 
           echo ""
 
+          echo ""
           echo "=========================================="
-          echo "MEMORY"
+          echo "MEMORY AFTER MODEL LOAD"
           echo "=========================================="
 
           free -h
 
+          echo ""
+          echo "=========================================="
+          echo "PROCESS MEMORY"
+          echo "=========================================="
+
+          ps aux --sort=-%mem | head -n 10
+
 
       # ------------------------------------------------------------
-      # 7. Local benchmark
+      # 7. Benchmark
       #
-      # IMPORTANT:
-      # We use max_tokens=400 so every model is tested
-      # under approximately the same generation workload.
+      # Same 400-token generation workload as Qwen2.5-3B.
+      #
+      # This lets us directly compare:
+      #
+      # Qwen2.5 3B dense  -> ~16 tok/s
+      #
+      # OLMoE ~1B active  -> ??? tok/s
       # ------------------------------------------------------------
-      - name: Run 3B Benchmark
+      - name: Run OLMoE Benchmark
         run: |
           set -e
 
           echo ""
           echo "============================================================"
-          echo "       QWEN 2.5 3B Q4_K_M LLAMA.CPP BENCHMARK"
+          echo "       OLMoE 1B-7B Q4_K_M LLAMA.CPP BENCHMARK"
           echo "============================================================"
+
+          echo ""
+          echo "Context:"
+          echo "16384 tokens"
+
+          echo ""
+          echo "Generation target:"
+          echo "400 tokens"
+
+          echo ""
+          echo "Architecture:"
+          echo "MoE / ~7B total / ~1B active"
+
+          echo ""
 
           TOTAL_TOKENS=0
           TOTAL_GENERATION_TIME=0
@@ -255,12 +320,12 @@ jobs:
             START=$(date +%s.%N)
 
             RESPONSE=$(curl -s \
-              --max-time 120 \
+              --max-time 180 \
               -X POST \
               http://localhost:8080/v1/chat/completions \
               -H "Content-Type: application/json" \
               -d '{
-                "model": "qwen2.5-3b-instruct-q4_k_m.gguf",
+                "model": "olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
                 "messages": [
                   {
                     "role": "user",
@@ -276,7 +341,9 @@ jobs:
 
             TOTAL_TIME=$(awk "BEGIN {print $END - $START}")
 
-            if echo "$RESPONSE" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
+            if echo "$RESPONSE" \
+              | jq -e '.choices[0].message.content' \
+              > /dev/null 2>&1; then
 
               TOKENS=$(echo "$RESPONSE" \
                 | jq -r '.usage.completion_tokens // 0')
@@ -291,6 +358,7 @@ jobs:
                 echo "Approx TPS    : $TPS"
 
                 TOTAL_TOKENS=$((TOTAL_TOKENS + TOKENS))
+
                 TOTAL_GENERATION_TIME=$(awk \
                   "BEGIN {print $TOTAL_GENERATION_TIME + $TOTAL_TIME}")
 
@@ -328,14 +396,127 @@ jobs:
 
             echo ""
             echo "=========================================="
-            echo "AVERAGE THROUGHPUT: $AVG_TPS tokens/sec"
+            echo "AVERAGE THROUGHPUT"
+            echo "=========================================="
+            echo "$AVG_TPS tokens/sec"
+
+            echo ""
+            echo "=========================================="
+            echo "COMPARISON"
+            echo "=========================================="
+            echo "Qwen2.5 0.5B Q4_K_M : ~49 tok/s"
+            echo "Qwen2.5 3B Q4_K_M   : ~16 tok/s"
+            echo "OLMoE ~1B active    : $AVG_TPS tok/s"
             echo "=========================================="
 
           fi
 
 
       # ------------------------------------------------------------
-      # 8. Start Cloudflare Quick Tunnel
+      # 8. 16K CONTEXT TEST
+      #
+      # We deliberately create a large prompt and measure whether
+      # the model can actually process a long context.
+      # ------------------------------------------------------------
+      - name: Run 16K Context Test
+        run: |
+          set -e
+
+          echo ""
+          echo "============================================================"
+          echo "              16K CONTEXT TEST"
+          echo "============================================================"
+
+          echo "Generating large context..."
+
+          python3 - <<'PY'
+          text = """
+          Photosynthesis is the biological process through which
+          plants, algae, and certain microorganisms convert light
+          energy into chemical energy. The process occurs primarily
+          in chloroplasts and involves coordinated reactions between
+          photosystems, electron transport chains, ATP synthase,
+          NADPH production, and the Calvin cycle.
+          """
+
+          # Repeat enough text to create a substantial context.
+          with open("/tmp/long_context.txt", "w") as f:
+              for i in range(350):
+                  f.write(
+                      f"\nSECTION {i}\n"
+                      + text
+                  )
+
+          print("Generated context file:")
+          print("/tmp/long_context.txt")
+          PY
+
+          CONTEXT=$(cat /tmp/long_context.txt)
+
+          echo ""
+          echo "Sending large-context request..."
+
+          START=$(date +%s.%N)
+
+          RESPONSE=$(jq -n \
+            --arg context "$CONTEXT" \
+            '{
+              model: "olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
+              messages: [
+                {
+                  role: "user",
+                  content: (
+                    $context
+                    + "\n\nBased on all of the material above, summarize the key biological mechanisms involved in photosynthesis."
+                  )
+                }
+              ],
+              temperature: 0.2,
+              max_tokens: 200,
+              stream: false
+            }' \
+            | curl -s \
+              --max-time 300 \
+              -X POST \
+              http://localhost:8080/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              --data-binary @-)
+
+          END=$(date +%s.%N)
+
+          TOTAL_TIME=$(awk "BEGIN {print $END - $START}")
+
+          echo ""
+          echo "Response:"
+          echo "$RESPONSE" | jq .
+
+          echo ""
+          echo "16K test time:"
+          echo "${TOTAL_TIME}s"
+
+          if echo "$RESPONSE" \
+            | jq -e '.choices[0].message.content' \
+            > /dev/null 2>&1; then
+
+            echo ""
+            echo "=========================================="
+            echo "16K CONTEXT TEST: SUCCESS"
+            echo "=========================================="
+
+          else
+
+            echo ""
+            echo "=========================================="
+            echo "16K CONTEXT TEST: FAILED"
+            echo "=========================================="
+
+            exit 1
+
+          fi
+
+
+      # ------------------------------------------------------------
+      # 9. Start Cloudflare Quick Tunnel
       # ------------------------------------------------------------
       - name: Start Cloudflare Quick Tunnel
         run: |
@@ -382,36 +563,41 @@ jobs:
           echo "============================================================"
           echo "PUBLIC OPENAI-COMPATIBLE ENDPOINT"
           echo "============================================================"
+
           echo "$TUNNEL_URL"
+
           echo ""
           echo "API:"
           echo "$TUNNEL_URL/v1/chat/completions"
+
           echo "============================================================"
 
           echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
 
 
       # ------------------------------------------------------------
-      # 9. Test the public OpenAI-compatible endpoint
+      # 10. Test Public API
       # ------------------------------------------------------------
       - name: Test Public API
         run: |
+
           echo ""
           echo "Testing Cloudflare -> llama.cpp..."
 
           RESPONSE=$(curl -s \
-            --max-time 60 \
+            --max-time 120 \
             -X POST \
             "$TUNNEL_URL/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -d '{
-              "model": "qwen2.5-3b-instruct-q4_k_m.gguf",
+              "model": "olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
               "messages": [
                 {
                   "role": "user",
-                  "content": "What is the difference between a CPU and a GPU?"
+                  "content": "Explain why mixture-of-experts models can have many total parameters while using fewer active parameters for each token."
                 }
               ],
+              "temperature": 0.2,
               "max_tokens": 200,
               "stream": false
             }')
@@ -420,22 +606,35 @@ jobs:
 
 
       # ------------------------------------------------------------
-      # 10. Keep alive for external testing
+      # 11. Keep Alive
       # ------------------------------------------------------------
       - name: Keep Workflow Alive
         run: |
+
           echo ""
           echo "============================================================"
-          echo "LLAMA.CPP SERVER IS LIVE"
+          echo "              OLMoE SERVER IS LIVE"
           echo "============================================================"
+
           echo ""
           echo "Public endpoint:"
           echo "$TUNNEL_URL/v1/chat/completions"
+
           echo ""
           echo "Model:"
-          echo "Qwen2.5-3B-Instruct Q4_K_M"
+          echo "OLMoE-1B-7B-0924-Instruct Q4_K_M"
+
+          echo ""
+          echo "Architecture:"
+          echo "MoE / ~7B total / ~1B active"
+
+          echo ""
+          echo "Context:"
+          echo "16384 tokens"
+
           echo ""
           echo "The runner will remain alive for 15 minutes."
+
           echo "============================================================"
 
           sleep 900
