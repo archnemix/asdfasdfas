@@ -26,24 +26,41 @@ jobs:
       - name: Start Ollama with 16k context
         run: |
           # Start Ollama server with a 16k default context length
-          # This overrides the default 4k context window
           OLLAMA_CONTEXT_LENGTH=16384 ollama serve &
           sleep 10
-          # Verify the server is running
           curl -s http://localhost:11434/api/tags
 
-      - name: Pull Trinity Nano 4-bit model (via mirror)
+      - name: Download Trinity Nano 4-bit GGUF file directly
         run: |
-          # Using hf-mirror.com as a reliable workaround for the
-          # "blocked redirect to a different host" error from the official hf.co endpoint.
-          # See: https://github.com/ollama/ollama/issues/15661
-          ollama pull hf-mirror.com/arcee-ai/Trinity-Nano-Preview-GGUF:Q4_K_M
-          # Verify the model was downloaded
+          # Download the Q4_K_M quantized GGUF file directly from Hugging Face.
+          # This bypasses Ollama's registry client entirely, avoiding the redirect issue.
+          # The file is ~3.8 GB, so this may take a few minutes.
+          curl -L -o Trinity-Nano-Preview-Q4_K_M.gguf \
+            "https://huggingface.co/arcee-ai/Trinity-Nano-Preview-GGUF/resolve/main/Trinity-Nano-Preview-Q4_K_M.gguf?download=true"
+          
+          # Verify the download
+          ls -lh Trinity-Nano-Preview-Q4_K_M.gguf
+          file Trinity-Nano-Preview-Q4_K_M.gguf
+
+      - name: Create Modelfile and import model
+        run: |
+          # Create a Modelfile that points to the local GGUF file
+          cat > Modelfile << 'EOF'
+          FROM ./Trinity-Nano-Preview-Q4_K_M.gguf
+          PARAMETER temperature 0.7
+          PARAMETER top_p 0.9
+          PARAMETER num_ctx 16384
+          EOF
+          
+          # Import the model into Ollama
+          ollama create trinity-nano-4bit -f Modelfile
+          
+          # Verify the model was created
           ollama list
+          ollama show trinity-nano-4bit
 
       - name: Verify context window is set to 16k
         run: |
-          # The CONTEXT column in the output should show 16384
           ollama ps
 
       - name: Download and prepare a long conversational text
@@ -51,6 +68,7 @@ jobs:
           # Download a public-domain play from Project Gutenberg (The Importance of Being Earnest)
           # This play is entirely dialogue, making it a perfect conversational test case.
           curl -s -o play.txt https://www.gutenberg.org/files/844/844-0.txt
+          
           # Remove Project Gutenberg header/footer and normalize whitespace
           python3 -c "
           import re
@@ -97,9 +115,8 @@ jobs:
           with open('prompt.txt', 'w', encoding='utf-8') as f:
               f.write(prompt)
           "
-          echo \"=== Testing with ~14k-15k token conversational prompt ===\"
-          # Use the mirror model name for inference
-          time ollama run hf-mirror.com/arcee-ai/Trinity-Nano-Preview-GGUF:Q4_K_M < prompt.txt
+          echo "=== Testing with ~14k-15k token conversational prompt ==="
+          time ollama run trinity-nano-4bit < prompt.txt
 
       - name: Check memory usage and model info
         run: |
@@ -107,7 +124,7 @@ jobs:
           ps aux | grep ollama
           echo ""
           echo "=== Model info ==="
-          ollama show hf-mirror.com/arcee-ai/Trinity-Nano-Preview-GGUF:Q4_K_M
+          ollama show trinity-nano-4bit
 
       - name: Report context allocation
         run: |
