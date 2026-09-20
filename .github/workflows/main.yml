@@ -1,14 +1,64 @@
-name: Trinity Nano 4-bit 16k Context Test
+name: Multi-Architecture Model Benchmark Matrix
 
 on:
-  workflow_dispatch: # Allows manual trigger from the Actions tab
+  workflow_dispatch:
   push:
     branches: [main]
 
 jobs:
-  test-trinity-nano:
+  benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false   # One model failing won't cancel the others
+      matrix:
+        include:
+          # ---------- Transformer models ----------
+          - name: llama-3.2-1b
+            architecture: Transformer
+            file: Llama-3.2-1B-Instruct-Q4_K_M.gguf
+            url: https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+            num_ctx_native: 131072
+
+          - name: smollm2-1.7b
+            architecture: Transformer
+            file: SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+            url: https://huggingface.co/jc-builds/SmolLM2-1.7B-Instruct-Q4_K_M-GGUF/resolve/main/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+            num_ctx_native: 8192
+
+          - name: gemma-2-2b
+            architecture: Transformer
+            file: gemma-2-2b-it-Q4_K_M.gguf
+            url: https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf
+            num_ctx_native: 8192
+
+          # ---------- Mamba ----------
+          - name: falcon-mamba-7b
+            architecture: Mamba
+            file: falcon-mamba-7B-instruct-Q4_K_M.gguf
+            url: https://huggingface.co/tiiuae/falcon-mamba-7b-instruct-Q4_K_M-GGUF/resolve/main/falcon-mamba-7B-instruct-Q4_K_M.gguf
+            num_ctx_native: 8192
+
+          # ---------- Jamba (Hybrid) ----------
+          - name: jamba-reasoning-3b
+            architecture: Jamba
+            file: ai21labs_AI21-Jamba-Reasoning-3B-Q4_K_M.gguf
+            url: https://huggingface.co/bartowski/ai21labs_AI21-Jamba-Reasoning-3B-GGUF/resolve/main/ai21labs_AI21-Jamba-Reasoning-3B-Q4_K_M.gguf
+            num_ctx_native: 262144
+
+          # ---------- Nemotron (Hybrid Mamba2) ----------
+          - name: nemotron-3-nano-4b
+            architecture: Nemotron
+            file: NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf
+            url: https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-4B-GGUF/resolve/main/NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf
+            num_ctx_native: 1048576
+
+          # ---------- RWKV ----------
+          - name: rwkv7-1.5b
+            architecture: RWKV
+            file: rwkv7-g1j-1.5b-Q4_K_M.gguf
+            url: https://huggingface.co/shoumenchougou/RWKV7-G1j-1.5B-GGUF/resolve/main/rwkv7-g1j-1.5b-Q4_K_M.gguf
+            num_ctx_native: 65536
 
     steps:
       - name: Checkout repository
@@ -23,38 +73,33 @@ jobs:
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
 
-      - name: Start Ollama with 16k context
+      - name: Start Ollama
         run: |
-          OLLAMA_CONTEXT_LENGTH=16384 ollama serve &
+          ollama serve &
           sleep 10
           curl -s http://localhost:11434/api/tags
 
-      - name: Download Trinity Nano 4-bit GGUF file directly
+      - name: Download ${{ matrix.name }} GGUF
         run: |
-          # Direct download bypasses Ollama's registry redirect validation bug
-          curl -L -o Trinity-Nano-Preview-Q4_K_M.gguf \
-            "https://huggingface.co/arcee-ai/Trinity-Nano-Preview-GGUF/resolve/main/Trinity-Nano-Preview-Q4_K_M.gguf?download=true"
-          ls -lh Trinity-Nano-Preview-Q4_K_M.gguf
-          file Trinity-Nano-Preview-Q4_K_M.gguf
+          curl -L -o "${{ matrix.file }}" "${{ matrix.url }}"
+          ls -lh "${{ matrix.file }}"
+          file "${{ matrix.file }}"
 
-      - name: Create Modelfile and import model
+      - name: Create Modelfile and import
         run: |
           cat > Modelfile << 'EOF'
-          FROM ./Trinity-Nano-Preview-Q4_K_M.gguf
+          FROM ./${{ matrix.file }}
           PARAMETER temperature 0.7
           PARAMETER top_p 0.9
-          PARAMETER num_ctx 16384
           EOF
-
-          ollama create trinity-nano-4bit -f Modelfile
+          ollama create bench-model -f Modelfile
           ollama list
-          ollama show trinity-nano-4bit
+          ollama show bench-model
 
-      - name: Verify context window is set to 16k
-        run: |
-          ollama ps
+      - name: Install Python dependencies
+        run: pip install requests
 
-      - name: Download and prepare a long conversational text
+      - name: Prepare long conversational text
         run: |
           curl -s -o play.txt https://www.gutenberg.org/files/844/844-0.txt
           python3 -c "
@@ -69,162 +114,185 @@ jobs:
           with open('clean_play.txt', 'w', encoding='utf-8') as f:
               f.write(text)
           "
-
-      - name: Ensure text is within 14k-15k tokens
-        run: |
           python3 -c "
           MIN_WORDS = 10500
-          MAX_WORDS = 11250
+          MAX_WORDS = 40000
           with open('clean_play.txt', 'r', encoding='utf-8') as f:
               text = f.read()
           words = text.split()
           print(f'Original word count: {len(words)}')
-          if len(words) < MIN_WORDS:
-              print('Text too short, padding...')
-              while len(words) < MIN_WORDS:
-                  text += ' ' + text
-                  words = text.split()
-          elif len(words) > MAX_WORDS:
-              print('Text too long, truncating...')
+          while len(words) < MIN_WORDS:
+              text += ' ' + text
+              words = text.split()
+          if len(words) > MAX_WORDS:
               text = ' '.join(words[:MAX_WORDS])
           with open('final_text.txt', 'w', encoding='utf-8') as f:
               f.write(text)
           print(f'Final word count: {len(text.split())}')
           "
 
-      - name: Install Python dependencies
+      - name: Run benchmark across context lengths
+        continue-on-error: true
         run: |
-          pip install requests
+          cat > bench_all.py << 'PYEOF'
+          import json, time, threading, subprocess, requests, sys, os
 
-      - name: Run streaming inference with token/sec measurement
-        run: |
-          python3 -c "
+          MODEL = 'bench-model'
+          CONTEXT_LENGTHS = [4096, 8192, 16384, 32768]
+          RESULTS = []
+
           with open('final_text.txt', 'r', encoding='utf-8') as f:
-              long_text = f.read()
-          with open('prompt.txt', 'w', encoding='utf-8') as f:
-              f.write(long_text + '\n\nPlease summarize the main theme of this conversation in one sentence.')
-          "
+              full_text = f.read()
+          words = full_text.split()
 
-          cat > benchmark.py << 'PYEOF'
-          import json, time, threading, subprocess, requests, sys
-
-          # ---------- Background resource monitor ----------
-          samples = []
-          stop_flag = threading.Event()
-
-          def monitor():
-              pid = None
-              try:
-                  out = subprocess.check_output(['pgrep', '-f', 'llama-server']).decode().strip()
-                  if out:
-                      pid = out.splitlines()[0]
-              except Exception:
-                  pass
+          def monitor(pid_holder, samples, stop_flag):
               while not stop_flag.is_set():
                   try:
+                      pid = pid_holder[0]
                       if pid:
                           ps = subprocess.check_output(
-                              ['ps', '-p', pid, '-o', '%cpu=,rss=']
+                              ['ps', '-p', str(pid), '-o', '%cpu=,rss=']
                           ).decode().strip().split()
-                          cpu = float(ps[0])
-                          rss_mb = int(ps[1]) / 1024.0
-                      else:
-                          cpu, rss_mb = 0.0, 0.0
-                      samples.append((time.time(), cpu, rss_mb))
+                          samples.append((time.time(), float(ps[0]), int(ps[1])/1024.0))
                   except Exception:
                       pass
                   time.sleep(0.5)
 
-          monitor_thread = threading.Thread(target=monitor, daemon=True)
-          monitor_thread.start()
+          for ctx in CONTEXT_LENGTHS:
+              result = {
+                  'context_length': ctx,
+                  'status': 'unknown',
+                  'error': None,
+                  'ttft_s': None,
+                  'total_time_s': None,
+                  'tokens_generated': None,
+                  'generation_tok_s': None,
+                  'end_to_end_tok_s': None,
+                  'cpu_avg_pct': None,
+                  'cpu_peak_pct': None,
+                  'ram_avg_mb': None,
+                  'ram_peak_mb': None,
+              }
+              # Trim text to roughly fill the context (1 token ~ 0.75 words)
+              target_words = int(ctx * 0.75)
+              trimmed = ' '.join(words[:target_words])
 
-          # ---------- Streaming inference ----------
-          with open('prompt.txt') as f:
-              prompt = f.read()
+              print(f'\n===== Testing context {ctx} =====')
+              try:
+                  # Kill any previous llama-server so we measure fresh
+                  subprocess.run(['pkill', '-f', 'llama-server'], capture_output=True)
+                  time.sleep(3)
 
-          payload = {
-              'model': 'trinity-nano-4bit',
-              'prompt': prompt,
-              'stream': True,
-              'options': {'num_ctx': 16384}
-          }
+                  # Start Ollama's runner by sending a tiny request first
+                  payload = {
+                      'model': MODEL,
+                      'prompt': trimmed + '\n\nSummarize the main theme of this conversation in one sentence.',
+                      'stream': True,
+                      'options': {'num_ctx': ctx},
+                  }
 
-          print('=== Streaming response ===')
-          start = time.time()
-          first_token_time = None
-          token_count = 0
+                  samples = []
+                  stop_flag = threading.Event()
+                  pid_holder = [None]
 
-          with requests.post('http://localhost:11434/api/generate',
-                             json=payload, stream=True, timeout=3600) as r:
-              r.raise_for_status()
-              for line in r.iter_lines():
-                  if not line:
-                      continue
-                  chunk = json.loads(line)
-                  if 'response' in chunk and chunk['response']:
-                      if first_token_time is None:
-                          first_token_time = time.time()
-                      token_count += 1
-                      sys.stdout.write(chunk['response'])
-                      sys.stdout.flush()
-                  if chunk.get('done'):
-                      break
+                  # Find llama-server PID after a short delay
+                  def find_pid():
+                      try:
+                          out = subprocess.check_output(
+                              ['pgrep', '-f', 'llama-server']
+                          ).decode().strip()
+                          if out:
+                              pid_holder[0] = out.splitlines()[0]
+                      except Exception:
+                          pass
 
-          end = time.time()
-          stop_flag.set()
-          monitor_thread.join(timeout=2)
+                  monitor_thread = threading.Thread(
+                      target=monitor, args=(pid_holder, samples, stop_flag), daemon=True
+                  )
+                  monitor_thread.start()
 
-          # ---------- Metrics ----------
-          total_time = end - start
-          gen_time = end - first_token_time if first_token_time else total_time
-          ttft = (first_token_time - start) if first_token_time else None
+                  start = time.time()
+                  first_token_time = None
+                  token_count = 0
 
-          print()
-          print('=== Metrics ===')
-          print(f'Total wall time:        {total_time:.2f} s')
-          if ttft is not None:
-              print(f'Time to first token:    {ttft:.2f} s')
-          print(f'Generated tokens:       {token_count}')
-          print(f'Generation tok/s:       {token_count / gen_time:.2f}')
-          print(f'End-to-end tok/s:       {token_count / total_time:.2f}')
+                  with requests.post(
+                      'http://localhost:11434/api/generate',
+                      json=payload, stream=True, timeout=3600
+                  ) as r:
+                      r.raise_for_status()
+                      # Grab PID in parallel
+                      threading.Thread(target=find_pid, daemon=True).start()
+                      for line in r.iter_lines():
+                          if not line:
+                              continue
+                          chunk = json.loads(line)
+                          if chunk.get('response'):
+                              if first_token_time is None:
+                                  first_token_time = time.time()
+                              token_count += 1
+                              sys.stdout.write(chunk['response'])
+                              sys.stdout.flush()
+                          if chunk.get('done'):
+                              break
 
-          if samples:
-              cpus = [s[1] for s in samples]
-              rams = [s[2] for s in samples]
-              print()
-              print('=== Resource usage during inference ===')
-              print(f'Samples:                {len(samples)}')
-              print(f'CPU  avg / peak:        {sum(cpus)/len(cpus):.1f}% / {max(cpus):.1f}%')
-              print(f'RAM  avg / peak:        {sum(rams)/len(rams):.0f} MB / {max(rams):.0f} MB')
+                  end = time.time()
+                  stop_flag.set()
+                  monitor_thread.join(timeout=2)
+
+                  total_time = end - start
+                  gen_time = (end - first_token_time) if first_token_time else total_time
+
+                  result.update({
+                      'status': 'success',
+                      'ttft_s': round(first_token_time - start, 2) if first_token_time else None,
+                      'total_time_s': round(total_time, 2),
+                      'tokens_generated': token_count,
+                      'generation_tok_s': round(token_count / gen_time, 2) if gen_time else None,
+                      'end_to_end_tok_s': round(token_count / total_time, 2) if total_time else None,
+                  })
+
+                  if samples:
+                      cpus = [s[1] for s in samples]
+                      rams = [s[2] for s in samples]
+                      result.update({
+                          'cpu_avg_pct': round(sum(cpus)/len(cpus), 1),
+                          'cpu_peak_pct': round(max(cpus), 1),
+                          'ram_avg_mb': round(sum(rams)/len(rams)),
+                          'ram_peak_mb': round(max(rams)),
+                      })
+
+              except Exception as e:
+                  result['status'] = 'failed'
+                  result['error'] = f'{type(e).__name__}: {e}'
+                  print(f'\n!!! FAILED at ctx={ctx}: {e}')
+
+              RESULTS.append(result)
+              print(f'\nResult for ctx={ctx}: {json.dumps(result, indent=2)}')
+
+              # Clean up between context tests
+              subprocess.run(['pkill', '-f', 'llama-server'], capture_output=True)
+              time.sleep(5)
+
+          with open('benchmark_results.json', 'w') as f:
+              json.dump({
+                  'model': MODEL,
+                  'architecture': os.environ.get('ARCH', 'unknown'),
+                  'context_lengths_tested': CONTEXT_LENGTHS,
+                  'results': RESULTS,
+              }, f, indent=2)
+
+          print('\n===== FINAL SUMMARY =====')
+          print(json.dumps(RESULTS, indent=2))
           PYEOF
 
-          python3 benchmark.py | tee benchmark_output.txt
+          ARCH="${{ matrix.architecture }}" python3 bench_all.py 2>&1 | tee benchmark_log.txt
 
-      - name: Ollama native metrics (verbose)
-        run: |
-          echo "=== Ollama native --verbose metrics ==="
-          time ollama run trinity-nano-4bit --verbose < prompt.txt
-
-      - name: Check memory usage and model info
-        run: |
-          echo "=== Ollama process memory usage ==="
-          ps aux | grep ollama
-          echo ""
-          echo "=== Model info ==="
-          ollama show trinity-nano-4bit
-
-      - name: Report context allocation
-        run: |
-          echo "=== Current context allocation ==="
-          ollama ps
-
-      - name: Upload benchmark results
+      - name: Upload results artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trinity-nano-benchmark
+          name: benchmark-${{ matrix.name }}
           path: |
-            benchmark_output.txt
-            prompt.txt
-            final_text.txt
-          retention-days: 7
+            benchmark_results.json
+            benchmark_log.txt
+          retention-days: 30
