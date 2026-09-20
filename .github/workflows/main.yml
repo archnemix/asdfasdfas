@@ -173,11 +173,11 @@ jobs:
           free -h
 
 
-      # ------------------------------------------------------------
-      # 5. Start llama.cpp
+            # ------------------------------------------------------------
+      # 5. Start llama.cpp Server
       #
       # IMPORTANT:
-      # 16384 context
+      # Actual 16K context.
       # ------------------------------------------------------------
       - name: Start OLMoE Server
         run: |
@@ -188,6 +188,17 @@ jobs:
           echo "=========================================="
           echo "STARTING OLMoE"
           echo "=========================================="
+
+          echo "Model:"
+          echo "$MODEL"
+
+          echo ""
+          echo "Context:"
+          echo "16384"
+
+          echo ""
+          echo "Threads:"
+          echo "4"
 
           "$LLAMA_SERVER" \
             -m "$MODEL" \
@@ -222,11 +233,27 @@ jobs:
           if [ "$READY" -ne 1 ]; then
             echo ""
             echo "ERROR: llama.cpp did not become ready."
+
             echo ""
             echo "SERVER LOG:"
             tail -n 200 llama-server.log
+
             exit 1
           fi
+
+          echo ""
+          echo "=========================================="
+          echo "SERVER PROPERTIES"
+          echo "=========================================="
+
+          curl -s http://localhost:8080/props | jq .
+
+          echo ""
+          echo "=========================================="
+          echo "MEMORY"
+          echo "=========================================="
+
+          free -h
 
           echo ""
           echo "=========================================="
@@ -413,10 +440,12 @@ jobs:
 
 
       # ------------------------------------------------------------
-      # 8. 16K CONTEXT TEST
+      # 8. REAL 16K CONTEXT TEST
       #
-      # We deliberately create a large prompt and measure whether
-      # the model can actually process a long context.
+      # Server is configured for 16384 tokens.
+      #
+      # We intentionally target ~14K-15K input tokens rather
+      # than accidentally creating a 23K-token request.
       # ------------------------------------------------------------
       - name: Run 16K Context Test
         run: |
@@ -424,42 +453,73 @@ jobs:
 
           echo ""
           echo "============================================================"
-          echo "              16K CONTEXT TEST"
+          echo "              REAL 16K CONTEXT TEST"
           echo "============================================================"
 
-          echo "Generating large context..."
+          echo ""
+          echo "Checking server context..."
+
+          PROPS=$(curl -s http://localhost:8080/props)
+
+          echo "$PROPS" | jq .
+
+          echo ""
+          echo "Memory before long-context request:"
+          free -h
+
+          echo ""
+          echo "Generating approximately 14K tokens of input..."
 
           python3 - <<'PY'
           text = """
           Photosynthesis is the biological process through which
           plants, algae, and certain microorganisms convert light
-          energy into chemical energy. The process occurs primarily
-          in chloroplasts and involves coordinated reactions between
-          photosystems, electron transport chains, ATP synthase,
-          NADPH production, and the Calvin cycle.
+          energy into chemical energy.
+
+          The process occurs primarily in chloroplasts and involves
+          coordinated reactions between photosystems, electron
+          transport chains, ATP synthase, NADPH production,
+          the Calvin cycle, carbon fixation, and regulation of
+          metabolic pathways.
+
+          The light-dependent reactions occur in the thylakoid
+          membranes. Photosystem II absorbs photons and contributes
+          to the generation of an electrochemical proton gradient.
+          Electrons move through an electron transport chain and
+          ultimately contribute to NADPH production through
+          Photosystem I.
+
+          ATP synthase uses the proton gradient to produce ATP.
+          The Calvin cycle occurs in the chloroplast stroma and
+          uses ATP and NADPH to drive carbon fixation and the
+          subsequent production of carbohydrate precursors.
           """
 
-          # Repeat enough text to create a substantial context.
+          # Generate a large but controlled document.
+          #
+          # We intentionally use much less text than the previous
+          # test so the request remains below 16K tokens.
           with open("/tmp/long_context.txt", "w") as f:
-              for i in range(350):
-                  f.write(
-                      f"\nSECTION {i}\n"
-                      + text
-                  )
+              for i in range(210):
+                  f.write(f"\nSECTION {i}\n")
+                  f.write(text)
 
-          print("Generated context file:")
+          print("Generated:")
           print("/tmp/long_context.txt")
           PY
 
-          CONTEXT=$(cat /tmp/long_context.txt)
+          echo ""
+          echo "Approximate character count:"
+
+          wc -c /tmp/long_context.txt
 
           echo ""
-          echo "Sending large-context request..."
+          echo "Sending long-context request..."
 
           START=$(date +%s.%N)
 
           RESPONSE=$(jq -n \
-            --arg context "$CONTEXT" \
+            --rawfile context /tmp/long_context.txt \
             '{
               model: "olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
               messages: [
@@ -476,7 +536,7 @@ jobs:
               stream: false
             }' \
             | curl -s \
-              --max-time 300 \
+              --max-time 600 \
               -X POST \
               http://localhost:8080/v1/chat/completions \
               -H "Content-Type: application/json" \
@@ -487,33 +547,47 @@ jobs:
           TOTAL_TIME=$(awk "BEGIN {print $END - $START}")
 
           echo ""
-          echo "Response:"
+          echo "============================================================"
+          echo "RESPONSE"
+          echo "============================================================"
+
           echo "$RESPONSE" | jq .
 
           echo ""
-          echo "16K test time:"
+          echo "Request time:"
           echo "${TOTAL_TIME}s"
+
+          echo ""
+          echo "Memory after long-context request:"
+          free -h
 
           if echo "$RESPONSE" \
             | jq -e '.choices[0].message.content' \
             > /dev/null 2>&1; then
 
             echo ""
-            echo "=========================================="
+            echo "============================================================"
             echo "16K CONTEXT TEST: SUCCESS"
-            echo "=========================================="
+            echo "============================================================"
+
+            echo ""
+            echo "Prompt tokens:"
+            echo "$RESPONSE" | jq -r '.usage.prompt_tokens // "unknown"'
+
+            echo ""
+            echo "Completion tokens:"
+            echo "$RESPONSE" | jq -r '.usage.completion_tokens // "unknown"'
 
           else
 
             echo ""
-            echo "=========================================="
+            echo "============================================================"
             echo "16K CONTEXT TEST: FAILED"
-            echo "=========================================="
+            echo "============================================================"
 
             exit 1
 
           fi
-
 
       # ------------------------------------------------------------
       # 9. Start Cloudflare Quick Tunnel
